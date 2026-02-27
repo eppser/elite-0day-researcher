@@ -21,7 +21,7 @@ Where ASSUMPTIONS FAIL.
 
 ## The Iron Law
 
-**Every claimed vulnerability MUST demonstrate privilege escalation, trust boundary violation, or unauthorized state transition. A working PoC that demonstrates expected behavior is NOT a vulnerability.**
+**Every claimed vulnerability MUST: (1) demonstrate privilege escalation, trust boundary violation, or unauthorized state transition, (2) be validated dynamically against a running system in production-representative configuration, and (3) be verified as novel against known CVEs. A finding that fails ANY of these is not a reportable 0-day. No exceptions.**
 
 ---
 
@@ -303,30 +303,108 @@ echo "[*] This demonstrates: [Trust boundary crossed]"
 echo "[*] Control test: [Show that fix would prevent this]"
 ```
 
-### 4.3 Dynamic Validation
+---
 
-Static analysis finds candidates. Dynamic validation proves them.
+## Phase 5: Mandatory Dynamic Validation (HARD GATE)
+
+**No finding is accepted without dynamic proof against a running system. This is not optional. Static analysis finds candidates — dynamic validation makes them real.**
 
 ```
-For each finding:
-1. Set up a MINIMAL test environment (default config, not custom)
-2. Run the PoC against the running system
-3. Capture the response — does it match the predicted behavior?
-4. Run a CONTROL test — does the fix prevent the behavior?
-5. Record: PASS (exploitable) / FAIL (not exploitable) / PARTIAL
+MANDATORY REQUIREMENTS:
 
-Error oracle analysis (for blind vulnerabilities):
-- Compare error messages for different inputs
-- Different error = different code path = information leak
-- Time differences = timing oracle
-- Connection behavior = port/service discovery
+STEP 1 — ENVIRONMENT SETUP:
+  Set up the target in PRODUCTION-REPRESENTATIVE configuration.
+  NOT dev mode. NOT debug mode. NOT single-node-test-mode.
+
+  If you MUST use dev mode: every finding that depends on a dev-mode-only
+  feature (e.g., raw storage endpoint, hardcoded root token, disabled auth)
+  gets tagged as DEV-MODE-DEPENDENT and severity is capped at LOW.
+
+  Document the exact configuration used:
+  - Version and commit hash
+  - Configuration flags that differ from defaults
+  - Auth methods enabled
+  - Storage backend
+
+STEP 2 — EXECUTE EACH PoC:
+  For EVERY finding, run the PoC against the live system.
+  Record the EXACT output (not a summary, not "it worked").
+
+  Capture:
+  - HTTP response code and body
+  - Error messages (verbatim)
+  - State changes (before and after)
+  - Timing information (for timing oracles)
+
+STEP 3 — VALIDATE PREDICTED BEHAVIOR:
+  Does the actual output match the PREDICTED behavior from static analysis?
+  - YES → PASS (proceed)
+  - PARTIALLY → document what differs, assess if it changes severity
+  - NO → FAIL (finding is theoretical, not confirmed)
+
+STEP 4 — CONTROL TEST (MANDATORY):
+  Apply the suggested fix (or simulate it) and re-run the PoC.
+  - Does the fix PREVENT the vulnerability? → Fix confirmed
+  - Does the fix NOT break normal functionality? → Fix is safe
+  - If you can't run a control test, document WHY and flag the finding
+    as UNCONTROLLED
+
+STEP 5 — ERROR ORACLE ANALYSIS (for blind/indirect vulns):
+  When the vulnerability is blind (SSRF, timing, etc.):
+  - Send the exploit input → record error/response
+  - Send a benign input → record error/response
+  - Send to a known-closed port → record error/response
+  - DIFFERENT responses = information oracle confirmed
+  - IDENTICAL responses = no oracle, finding may be theoretical
+
+STEP 6 — RECORD RESULT:
+  For each finding:
+    dynamic_status: CONFIRMED | PARTIAL | FAILED | DEV-MODE-DEPENDENT
+    evidence: [exact output captured]
+    control_test: PASS | FAIL | NOT_RUN (with reason)
+
+HARD STOP:
+  If dynamic_status = FAILED → finding is REJECTED.
+  Do not report findings that cannot be demonstrated dynamically.
+  Do not report findings as "likely exploitable" or "theoretically possible."
+  If it doesn't work against a running system, it doesn't ship.
+
+EXCEPTION:
+  Race conditions and timing-dependent bugs that are demonstrably real
+  in code but difficult to trigger reliably may be reported as CONFIRMED
+  (TIMING-DEPENDENT) with the static evidence + best dynamic attempt.
+  These must still have at least one successful dynamic trigger or a
+  clear explanation of why the timing window is realistic.
+```
+
+### Error Oracle Quick Reference
+
+```
+For SSRF / blind network vulnerabilities:
+
+Response                          → Meaning
+─────────────────────────────────────────────────────────
+"asn1: structure error: tags..."  → Connected, got non-CRL data (port open)
+"connection refused"              → Port closed
+"i/o timeout"                     → Port filtered / host unreachable
+"no such host"                    → DNS resolution failed
+200 OK with content              → Full SSRF (jackpot)
+Different response times          → Timing oracle
+
+For auth / logic bugs:
+─────────────────────────────────────────────────────────
+204 No Content on write           → Action succeeded (check if it should have)
+403 Forbidden                     → Auth check worked (expected for control test)
+200 OK when expecting 403         → Auth bypass confirmed
+Old credentials still work        → Password update didn't take effect
+New credentials rejected          → State mutation bug confirmed
 ```
 
 ---
 
-## Phase 5: Novelty Verification
+## Phase 6: Novelty Verification
 
-**CRITICAL: Before claiming any finding is a 0-day, verify novelty.**
+**CRITICAL: Before claiming any finding is a 0-day, verify novelty. Only dynamically CONFIRMED findings (Phase 5) reach this stage.**
 
 ```
 For each finding:
@@ -362,7 +440,7 @@ OUTPUT: Tag each finding as NOVEL / VARIANT / KNOWN
 
 ---
 
-## Phase 6: Severity Assessment
+## Phase 7: Severity Assessment
 
 ### Real-World Severity Matrix
 
@@ -426,6 +504,7 @@ These are NOT vulnerabilities. Reporting them destroys credibility.
 
 **Severity:** [CRITICAL|HIGH|MEDIUM|LOW]
 **Novelty:** [NOVEL | VARIANT of CVE-XXXX-XXXXX]
+**Dynamic Validation:** CONFIRMED | PARTIAL | DEV-MODE-DEPENDENT
 **Attack Complexity:** [LOW|MEDIUM|HIGH]
 **Required Privilege:** [None|User|Operator|Admin]
 
@@ -441,6 +520,13 @@ what assumption does it violate]
 ### Reproduction
 [Exact commands to reproduce, with expected output]
 
+### Dynamic Evidence
+[Verbatim output from running PoC against live system]
+[Include: response codes, error messages, state changes]
+
+### Control Test
+[Evidence that the suggested fix prevents the vulnerability]
+
 ### Impact
 [What does the attacker gain BEYOND their starting privilege level?]
 
@@ -453,18 +539,28 @@ what assumption does it violate]
 ## Quick Reference: Hunt Checklist
 
 ```
+DISCOVERY:
 [ ] All entry points enumerated (not sampled)
 [ ] Trust boundaries mapped with privilege levels
 [ ] Each entry point tested against vulnerability patterns
 [ ] Attack trees built for each candidate finding
 [ ] PROXIMITY tracked for each exploitation attempt
+
+PoC & DYNAMIC VALIDATION (MANDATORY):
 [ ] PoC constructed for each confirmed finding
-[ ] Dynamic validation run against live system
+[ ] Target running in production-representative config (NOT dev mode)
+[ ] Each PoC executed against live system with output captured
+[ ] Control test run for each finding (fix prevents the issue)
+[ ] dynamic_status recorded: CONFIRMED / PARTIAL / FAILED
+[ ] Any FAILED findings removed from report
+[ ] Any DEV-MODE-DEPENDENT findings flagged and severity capped
+
+NOVELTY & CLASSIFICATION:
 [ ] Novelty verified (CVE check, advisory check, variant analysis)
 [ ] Severity assessed using privilege-aware matrix
 [ ] Each finding crosses a trust boundary (not a tautology)
 [ ] Each finding works on default/common configuration (not test harness)
-[ ] Report includes reproduction steps, impact, and fix
+[ ] Report includes reproduction steps, dynamic evidence, impact, and fix
 ```
 
 ---
@@ -473,6 +569,7 @@ what assumption does it violate]
 
 | You're thinking... | Reality |
 |---|---|
+| "I verified it statically, that's enough" | No. If it doesn't work against a running system, it doesn't ship. |
 | "Root can read secret data — CRITICAL!" | Root is inside the trust boundary. By-design. |
 | "Same key = same output — key reuse vuln!" | That's the mathematical definition of the algorithm. |
 | "This endpoint is unauthenticated!" | Check if the spec requires it to be unauthenticated. |
